@@ -9,6 +9,6 @@
   },
   "analysis": {
     "custom_prompt_path": "prompt.txt",
-    "description": "Optional: Path to custom prompt template file for AI analysis (leave empty to use default)"
+    "description": "Path to custom prompt template file for AI analysis (leave empty to use default)"
   }
 }
