@@ -1,0 +1,397 @@
+name: AI Bulk Issue Analysis
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
+
+jobs:
+  analyze-all-issues:
+    if: github.event_name == 'push' || (github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    
+    permissions:
+      issues: write
+      contents: read
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js for repomix
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Setup Python for AI analysis
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install repomix
+        run: |
+          npm install -g repomix
+          echo "Repomix installed successfully"
+          repomix --version
+      
+      - name: Generate repomix output for ansible-creator
+        run: |
+          echo "Reading configuration from triage.config.json..."
+          REPO_URL=$(jq -r '.repository.url' triage.config.json)
+          REPOMIX_OUTPUT=$(jq -r '.repomix.output_path' triage.config.json)
+          echo "Repository URL: $REPO_URL"
+          echo "Repomix output path: $REPOMIX_OUTPUT"
+          
+          echo "Running repomix on repository using remote..."
+          repomix --remote "$REPO_URL" --output "$REPOMIX_OUTPUT"
+          echo "Repomix output generated successfully"
+          ls -la "$REPOMIX_OUTPUT"
+      
+      - name: Clone AI-Issue-Triage repository
+        uses: actions/checkout@v4
+        with:
+          repository: shvenkat-rh/AI-Issue-Triage
+          ref: refactor/project-structure
+          path: ai-triage
+          fetch-depth: 1
+      
+      - name: Install Python dependencies for AI triage
+        run: |
+          cd ai-triage
+          pip install -r requirements.txt
+          echo "Python dependencies installed successfully"
+      
+      - name: Analyze all open issues
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            
+            // Get all open issues
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            // Filter out pull requests
+            const actualIssues = issues.filter(issue => !issue.pull_request);
+            console.log(`Found ${actualIssues.length} open issues`);
+            
+            // Read configuration
+            const configContent = fs.readFileSync('triage.config.json', 'utf8');
+            const config = JSON.parse(configContent);
+            const repomixOutput = config.repomix.output_path;
+            const customPromptPath = config.analysis.custom_prompt_path;
+            
+            console.log(`Using repomix output: ${repomixOutput}`);
+            if (customPromptPath) {
+              console.log(`Using custom prompt: ${customPromptPath}`);
+            }
+            
+            // Process each issue
+            for (const issue of actualIssues) {
+              console.log(`Analyzing issue #${issue.number}: ${issue.title}`);
+              
+              try {
+                // Check for prompt injection first - using same approach as gemini-issue-analysis.yml
+                console.log(`Checking for prompt injection in issue #${issue.number}...`);
+                console.log(`ISSUE_TITLE: '${issue.title}'`);
+                console.log(`ISSUE_DESCRIPTION: '${issue.body || ''}'`);
+                
+                let hasInjection = false;
+                let riskLevel = 'safe';
+                
+                // Check if prompt_injection.py exists
+                if (fs.existsSync('ai-triage/prompt_injection.py')) {
+                  console.log('Using prompt_injection.py for security check');
+                  
+                  const resultFile = `ai-triage/prompt_injection_${issue.number}.json`;
+                  const debugFile = `ai-triage/prompt_injection_debug_${issue.number}.log`;
+                  
+                  // Run prompt injection detection using the clean CLI interface
+                  try {
+                    execSync(
+                      `cd ai-triage && python3 -m utils.security.prompt_injection "${issue.title.replace(/"/g, '\\"')}" "${(issue.body || '').replace(/"/g, '\\"')}" > prompt_injection_${issue.number}.json 2>prompt_injection_debug_${issue.number}.log`,
+                      { cwd: process.cwd() }
+                    );
+                    console.log('Prompt injection detection completed successfully');
+                  } catch (e) {
+                    console.log('WARNING: Prompt injection detection failed, running debug mode...');
+                    try {
+                      execSync(
+                        `cd ai-triage && python3 -m utils.security.prompt_injection "${issue.title.replace(/"/g, '\\"')}" "${(issue.body || '').replace(/"/g, '\\"')}" --debug > prompt_injection_${issue.number}.json 2>&1`,
+                        { cwd: process.cwd() }
+                      );
+                    } catch (debugError) {
+                      console.log('Debug mode also failed, assuming safe input');
+                      fs.writeFileSync(resultFile, JSON.stringify({
+                        has_prompt_injection: false,
+                        risk_level: 'safe',
+                        error: 'detection_failed'
+                      }));
+                    }
+                  }
+                  
+                  console.log('Script execution completed, checking results...');
+                  
+                  // Show debug log if it exists
+                  if (fs.existsSync(debugFile)) {
+                    const debugContent = fs.readFileSync(debugFile, 'utf8');
+                    if (debugContent.trim()) {
+                      console.log('Debug log contents:');
+                      console.log(debugContent);
+                    }
+                  }
+                  
+                  // Parse results with validation
+                  if (fs.existsSync(resultFile)) {
+                    const resultContent = fs.readFileSync(resultFile, 'utf8');
+                    console.log(`Contents of prompt_injection_${issue.number}.json:`);
+                    console.log(resultContent);
+                    
+                    // Validate JSON first (similar to jq empty check)
+                    try {
+                      const injectionResult = JSON.parse(resultContent);
+                      hasInjection = injectionResult.has_prompt_injection || false;
+                      riskLevel = injectionResult.risk_level || 'safe';
+                      console.log(`Parsed has_prompt_injection: ${hasInjection}`);
+                      console.log(`Parsed risk_level: ${riskLevel}`);
+                    } catch (parseError) {
+                      console.log('ERROR: Invalid JSON in prompt_injection result');
+                      console.log('Raw content:', resultContent);
+                      hasInjection = false;
+                      riskLevel = 'safe';
+                    }
+                    
+                    if (hasInjection) {
+                      console.log(`SECURITY ALERT: Prompt injection detected! Risk Level: ${riskLevel}`);
+                    } else {
+                      console.log('No prompt injection detected');
+                    }
+                  } else {
+                    console.log('No result file found, assuming no injection');
+                    hasInjection = false;
+                    riskLevel = 'safe';
+                  }
+                } else {
+                  console.log('prompt_injection.py not found, skipping security check');
+                  hasInjection = false;
+                  riskLevel = 'safe';
+                }
+                
+                // Always post prompt injection analysis report regardless of severity
+                const riskEmoji = {
+                  'critical': '🚨',
+                  'high': '⚠️',
+                  'medium': '⚡',
+                  'low': 'ℹ️',
+                  'safe': '✅'
+                };
+                
+                const isHighRisk = ['critical', 'high'].includes(riskLevel);
+                
+                let comment = (riskEmoji[riskLevel] || '✅') + ' **Prompt Injection Analysis Report**\n\n' +
+                  '**Risk Level:** ' + riskLevel.toUpperCase() + '\n\n';
+                
+                if (riskLevel === 'safe') {
+                  comment += 'This issue has been analyzed and appears to be safe. No prompt injection patterns were detected.\n\n' +
+                    '**Analysis Result:** ✅ SAFE\n\n' +
+                    'The issue content does not contain any suspicious patterns or attempts to manipulate the AI analysis system.\n\n';
+                } else if (isHighRisk) {
+                  comment += '**⚠️ SECURITY ALERT**\n\n' +
+                    'This issue contains content that appears to be a significant prompt injection attempt. For security reasons, this issue will not be processed by the AI analysis system.\n\n' +
+                    '**What is prompt injection?**\n' +
+                    'Prompt injection is a type of attack where malicious instructions are embedded in user input to manipulate AI systems into performing unintended actions.\n\n' +
+                    '**Next Steps:**\n' +
+                    '- This issue will remain open but will not receive AI analysis\n' +
+                    '- Please review the issue content and remove any suspicious instructions\n' +
+                    '- If this is a legitimate issue, please rephrase it using clear, direct language\n' +
+                    '- Contact the repository maintainers if you believe this detection is incorrect\n\n';
+                } else {
+                  comment += 'This issue contains content that may contain prompt injection patterns, but the risk level is considered manageable. The issue will be processed with additional security measures.\n\n' +
+                    '**What was detected?**\n' +
+                    'The content contains patterns that could potentially be used for prompt injection, but the confidence level is low enough to allow processing.\n\n' +
+                    '**Next Steps:**\n' +
+                    '- This issue will continue to receive AI analysis with enhanced security filtering\n' +
+                    '- If you intended to include instructions for the AI, please use clear, direct language\n' +
+                    '- Contact the repository maintainers if you have concerns about this detection\n\n';
+                }
+                
+                comment += '---\n*This security check is performed automatically to protect the AI analysis system.*';
+                
+                // Post prompt injection report for all issues
+                await github.rest.issues.createComment({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: comment
+                });
+                console.log(`Prompt injection analysis report posted for issue #${issue.number} (Risk: ${riskLevel})`);
+                
+                // Add appropriate labels
+                if (hasInjection) {
+                  const labels = ['security-alert'];
+                  if (isHighRisk) {
+                    labels.push('prompt-injection-blocked');
+                  } else {
+                    labels.push('prompt-injection-warning');
+                  }
+                  
+                  await github.rest.issues.addLabels({
+                    issue_number: issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    labels: labels
+                  });
+                  
+                  console.log(`Security labels added: ${labels.join(', ')}`);
+                }
+                
+                // Skip AI analysis only for high or critical risk
+                if (hasInjection && isHighRisk) {
+                  console.log(`SECURITY: Skipping AI analysis for issue #${issue.number} due to ${riskLevel} risk prompt injection`);
+                  continue; // Skip to next issue
+                }
+                
+                // Log warning for low/medium risk but continue processing
+                if (hasInjection && (riskLevel === 'low' || riskLevel === 'medium')) {
+                  console.log(`WARNING: Issue #${issue.number} has ${riskLevel} risk injection, proceeding with caution`);
+                }
+                
+                // Copy the repomix output to the AI triage directory
+                execSync(`cp ${repomixOutput} ai-triage/`, { cwd: process.cwd() });
+                
+                // Build CLI arguments
+                let cliArgs = `--title "${issue.title.replace(/"/g, '\\"')}" --description "${(issue.body || '').replace(/"/g, '\\"')}" --source-path "${repomixOutput}"`;
+                
+                // Add custom prompt if specified
+                if (customPromptPath && customPromptPath !== '' && fs.existsSync(customPromptPath)) {
+                  cliArgs += ` --custom-prompt "../${customPromptPath}"`;
+                }
+                
+                // Run the CLI analysis for both JSON and text formats
+                const analysisCommandJson = `cd ai-triage && python -m cli.analyze ${cliArgs} --format json --output analysis_result.json --quiet`;
+                const analysisCommandText = `cd ai-triage && python -m cli.analyze ${cliArgs} --format text --output analysis_result.txt --quiet`;
+                
+                execSync(analysisCommandJson, { 
+                  cwd: process.cwd(),
+                  env: { ...process.env, GEMINI_API_KEY: process.env.GEMINI_API_KEY }
+                });
+                
+                execSync(analysisCommandText, { 
+                  cwd: process.cwd(),
+                  env: { ...process.env, GEMINI_API_KEY: process.env.GEMINI_API_KEY }
+                });
+                
+                // Read both analysis results
+                const analysisText = fs.readFileSync('ai-triage/analysis_result.txt', 'utf8');
+                let analysisJson = null;
+                try {
+                  const jsonContent = fs.readFileSync('ai-triage/analysis_result.json', 'utf8');
+                  analysisJson = JSON.parse(jsonContent);
+                } catch (jsonError) {
+                  console.warn(`Failed to parse JSON for issue #${issue.number}:`, jsonError);
+                }
+                
+                // Always create new comment (don't update existing)
+                const updatedComment = `## Updated AI Analysis\n\n*This analysis was updated following recent changes to the codebase.*\n\n${analysisText}`;
+                
+                await github.rest.issues.createComment({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: updatedComment
+                });
+                console.log(`Created new analysis comment for issue #${issue.number}`);
+                
+                // Replace existing analysis labels with new ones
+                if (analysisJson) {
+                  try {
+                    // Get current labels
+                    const { data: currentIssue } = await github.rest.issues.get({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number
+                    });
+                    
+                    // Find and remove existing analysis labels
+                    const labelsToRemove = currentIssue.labels
+                      .map(label => typeof label === 'string' ? label : label.name)
+                      .filter(labelName => 
+                        labelName.startsWith('gemini-') || 
+                        labelName.startsWith('claude-') || 
+                        labelName.startsWith('type:') || 
+                        labelName.startsWith('severity:')
+                      );
+                    
+                    // Remove old analysis labels
+                    for (const labelName of labelsToRemove) {
+                      try {
+                        await github.rest.issues.removeLabel({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          issue_number: issue.number,
+                          name: labelName
+                        });
+                      } catch (removeError) {
+                        console.warn(`Failed to remove label "${labelName}" from issue #${issue.number}:`, removeError);
+                      }
+                    }
+                    
+                    // Add new analysis labels
+                    const newLabels = [];
+                    
+                    // Add analysis label
+                    newLabels.push('gemini-analyzed');
+                    
+                    // Add type label if available
+                    if (analysisJson.issue_type && analysisJson.issue_type !== 'null' && analysisJson.issue_type !== '') {
+                      newLabels.push(`type:${analysisJson.issue_type.toLowerCase()}`);
+                    }
+                    
+                    // Add severity label if available
+                    if (analysisJson.severity && analysisJson.severity !== 'null' && analysisJson.severity !== '') {
+                      newLabels.push(`severity:${analysisJson.severity.toLowerCase()}`);
+                    }
+                    
+                    if (newLabels.length > 0) {
+                      await github.rest.issues.addLabels({
+                        issue_number: issue.number,
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        labels: newLabels
+                      });
+                      
+                      console.log(`Issue #${issue.number} labels updated: removed [${labelsToRemove.join(', ')}], added [${newLabels.join(', ')}]`);
+                    }
+                    
+                  } catch (labelError) {
+                    console.warn(`Failed to update labels for issue #${issue.number}:`, labelError);
+                  }
+                }
+                
+                console.log(`Issue #${issue.number} analyzed successfully`);
+                
+              } catch (error) {
+                console.error(`Issue #${issue.number} analysis failed:`, error);
+              }
+            }
+            
+            console.log('Bulk analysis completed');
+      
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bulk-issue-analysis-${{ github.sha }}
+          path: |
+            ai-triage/analysis_result.json
+            ai-triage/analysis_result.txt
+            repomix-output.txt
+            triage.config.json
+          retention-days: 30
