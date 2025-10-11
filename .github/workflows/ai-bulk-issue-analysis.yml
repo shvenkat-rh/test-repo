@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: shvenkat-rh/AI-Issue-Triage
-          ref: main
+          ref: refactor/project-structure
           path: ai-triage
           fetch-depth: 1
       
@@ -245,8 +245,9 @@ jobs:
             
             INJECTION_COMMENT="${INJECTION_COMMENT}---\n*This security check is performed automatically to protect the AI analysis system.*"
             
-            # Post comment
-            echo -e "$INJECTION_COMMENT" | gh issue comment "$ISSUE_NUMBER" --body-file - || echo "Failed to post injection comment"
+            # Post comment (write to file first to avoid escaping issues)
+            printf "%b" "$INJECTION_COMMENT" > "injection_comment_${ISSUE_NUMBER}.md"
+            gh issue comment "$ISSUE_NUMBER" --body-file "injection_comment_${ISSUE_NUMBER}.md" || echo "Failed to post injection comment"
             
             # Skip analysis for high/critical risk
             if [ "$RISK_LEVEL" = "critical" ] || [ "$RISK_LEVEL" = "high" ]; then
@@ -291,7 +292,9 @@ jobs:
                   DUP_COMMENT="${DUP_COMMENT}Please review the original issue before continuing with this one.\n\n"
                   DUP_COMMENT="${DUP_COMMENT}---\n*This check was performed during bulk analysis.*"
                   
-                  echo -e "$DUP_COMMENT" | gh issue comment "$ISSUE_NUMBER" --body-file - || echo "Failed to post duplicate comment"
+                  # Post comment (write to file first to avoid escaping issues)
+                  printf "%b" "$DUP_COMMENT" > "duplicate_comment_${ISSUE_NUMBER}.md"
+                  gh issue comment "$ISSUE_NUMBER" --body-file "duplicate_comment_${ISSUE_NUMBER}.md" || echo "Failed to post duplicate comment"
                   
                   echo "Skipping full AI analysis for duplicate issue"
                   continue
@@ -347,9 +350,9 @@ jobs:
             
             cd ..
             
-            # Post analysis comment
-            ANALYSIS_COMMENT="## Updated AI Analysis\n\n*This analysis was updated following recent changes to the codebase.*\n\n${ANALYSIS_TEXT}"
-            echo -e "$ANALYSIS_COMMENT" | gh issue comment "$ISSUE_NUMBER" --body-file - || echo "Failed to post analysis comment"
+            # Post analysis comment (write to file first to avoid escaping issues)
+            printf "## Updated AI Analysis\n\n*This analysis was updated following recent changes to the codebase.*\n\n%s" "$ANALYSIS_TEXT" > "analysis_comment_${ISSUE_NUMBER}.md"
+            gh issue comment "$ISSUE_NUMBER" --body-file "analysis_comment_${ISSUE_NUMBER}.md" || echo "Failed to post analysis comment"
             
             # Update labels
             if [ -f "ai-triage/analysis_result_${ISSUE_NUMBER}.json" ]; then
