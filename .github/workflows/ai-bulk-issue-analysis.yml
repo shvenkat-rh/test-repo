@@ -61,7 +61,7 @@ jobs:
           
           echo "Installing Python dependencies..."
           if pip install -r requirements.txt; then
-            echo "Python dependencies installed successfully"
+          echo "Python dependencies installed successfully"
           else
             echo "ERROR: Failed to install Python dependencies"
             echo "Requirements file contents:"
@@ -174,7 +174,7 @@ jobs:
           
           ISSUE_COUNT=0
           while IFS= read -r ISSUE_NUMBER; do
-            ((ISSUE_COUNT++))
+            ISSUE_COUNT=$((ISSUE_COUNT + 1))
             echo ""
             echo "================================================================"
             echo "Processing Issue #$ISSUE_NUMBER ($ISSUE_COUNT of $(wc -l < issue_numbers.txt))"
