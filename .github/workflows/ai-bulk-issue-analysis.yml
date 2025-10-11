@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: shvenkat-rh/AI-Issue-Triage
-          ref: refactor/project-structure
+          ref: main
           path: ai-triage
           fetch-depth: 1
       
@@ -70,17 +70,19 @@ jobs:
             const fs = require('fs');
             const { execSync } = require('child_process');
             
-            // Get all open issues
+            // Get all open issues (oldest first for smart duplicate detection)
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
-              per_page: 100
+              per_page: 100,
+              sort: 'created',      // Sort by creation date
+              direction: 'asc'      // Ascending = oldest first (for canonical duplicate handling)
             });
             
             // Filter out pull requests
             const actualIssues = issues.filter(issue => !issue.pull_request);
-            console.log(`Found ${actualIssues.length} open issues`);
+            console.log(`Found ${actualIssues.length} open issues (processing oldest → newest)`);
             
             // Read configuration
             const configContent = fs.readFileSync('triage.config.json', 'utf8');
@@ -93,7 +95,10 @@ jobs:
               console.log(`Using custom prompt: ${customPromptPath}`);
             }
             
-            // Process each issue
+            // Track already analyzed issues for duplicate detection
+            const analyzedIssues = [];
+            
+            // Process each issue (oldest to newest for canonical duplicate handling)
             for (const issue of actualIssues) {
               console.log(`Analyzing issue #${issue.number}: ${issue.title}`);
               
@@ -262,6 +267,92 @@ jobs:
                 if (hasInjection && (riskLevel === 'low' || riskLevel === 'medium')) {
                   console.log(`WARNING: Issue #${issue.number} has ${riskLevel} risk injection, proceeding with caution`);
                 }
+                
+                // Check for duplicates against already analyzed issues
+                console.log(`Checking for duplicates against ${analyzedIssues.length} previously analyzed issues...`);
+                let isDuplicate = false;
+                let duplicateOf = null;
+                let dupResult = null;
+                
+                if (analyzedIssues.length > 0) {
+                  // Create JSON file with existing issues for duplicate detection
+                  const existingIssuesForCheck = analyzedIssues.map(i => ({
+                    issue_id: i.number,
+                    title: i.title,
+                    description: i.body || '',
+                    status: 'open',
+                    url: i.html_url
+                  }));
+                  
+                  fs.writeFileSync('ai-triage/existing_issues_analyzed.json', JSON.stringify(existingIssuesForCheck, null, 2));
+                  
+                  try {
+                    // Run duplicate detection
+                    execSync(
+                      `cd ai-triage && python -m cli.duplicate_check --title "${issue.title.replace(/"/g, '\\"')}" --description "${(issue.body || '').replace(/"/g, '\\"')}" --issues existing_issues_analyzed.json --output json > duplicate_check_result.json 2>&1`,
+                      { cwd: process.cwd(), env: { ...process.env, GEMINI_API_KEY: process.env.GEMINI_API_KEY } }
+                    );
+                    
+                    // Parse duplicate detection result
+                    const dupContent = fs.readFileSync('ai-triage/duplicate_check_result.json', 'utf8');
+                    dupResult = JSON.parse(dupContent);
+                    
+                    if (dupResult.is_duplicate) {
+                      isDuplicate = true;
+                      duplicateOf = dupResult.duplicate_of;
+                      console.log(`✓ Issue #${issue.number} is a DUPLICATE of issue #${duplicateOf.issue_id}`);
+                      console.log(`  Confidence: ${dupResult.confidence_score}`);
+                      console.log(`  Reason: ${dupResult.reasoning}`);
+                    } else {
+                      console.log(`✓ Issue #${issue.number} is NOT a duplicate`);
+                    }
+                  } catch (dupError) {
+                    console.log(`Warning: Duplicate detection failed for issue #${issue.number}, assuming not duplicate`);
+                    console.log(dupError.message);
+                    isDuplicate = false;
+                  }
+                }
+                
+                // If duplicate, mark it and skip full analysis
+                if (isDuplicate && dupResult) {
+                  console.log(`Skipping full AI analysis for duplicate issue #${issue.number}`);
+                  
+                  // Add duplicate label
+                  await github.rest.issues.addLabels({
+                    issue_number: issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    labels: ['duplicate']
+                  });
+                  
+                  // Post duplicate comment
+                  const confidenceScore = dupResult.confidence_score ? (dupResult.confidence_score * 100).toFixed(0) : 'N/A';
+                  const duplicateComment = `## Duplicate Issue Detected\n\n` +
+                    `This issue appears to be a duplicate of #${duplicateOf.issue_id}.\n\n` +
+                    `**Confidence Score:** ${confidenceScore}%\n\n` +
+                    `**Reasoning:** ${dupResult.reasoning || 'Similar issue detected.'}\n\n` +
+                    `Please review the original issue before continuing with this one.\n\n` +
+                    `---\n*This check was performed during bulk analysis.*`;
+                  
+                  await github.rest.issues.createComment({
+                    issue_number: issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: duplicateComment
+                  });
+                  
+                  console.log(`Duplicate comment posted for issue #${issue.number}`);
+                  continue; // Skip to next issue
+                }
+                
+                // Add to analyzed issues list (before running full analysis)
+                analyzedIssues.push({
+                  number: issue.number,
+                  title: issue.title,
+                  body: issue.body || '',
+                  html_url: issue.html_url
+                });
+                console.log(`Added issue #${issue.number} to analyzed list (total: ${analyzedIssues.length})`);
                 
                 // Copy the repomix output to the AI triage directory
                 execSync(`cp ${repomixOutput} ai-triage/`, { cwd: process.cwd() });
