@@ -4,12 +4,10 @@ on:
   pull_request:
     types: [ closed ]
     branches: [ main ]
-  push:
-    branches: [ main ]
 
 jobs:
   analyze-all-issues:
-    if: github.event_name == 'push' || (github.event.pull_request.merged == true)
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     
     permissions:
@@ -128,13 +126,52 @@ jobs:
             echo "Using custom prompt: $CUSTOM_PROMPT_PATH"
           fi
           
+          # Verify required files exist
+          echo ""
+          echo "Verifying required files..."
+          if [ ! -f "$REPOMIX_OUTPUT" ]; then
+            echo "ERROR: Repomix output file not found: $REPOMIX_OUTPUT"
+            ls -la
+            exit 1
+          fi
+          echo "✓ Repomix output exists: $REPOMIX_OUTPUT"
+          
+          if [ ! -f "issue_numbers.txt" ]; then
+            echo "ERROR: issue_numbers.txt not found"
+            ls -la
+            exit 1
+          fi
+          echo "✓ Issue numbers file exists"
+          
+          ISSUE_COUNT_TOTAL=$(wc -l < issue_numbers.txt | tr -d ' ')
+          if [ "$ISSUE_COUNT_TOTAL" -eq 0 ]; then
+            echo "No issues to process. Exiting successfully."
+            exit 0
+          fi
+          echo "✓ Found $ISSUE_COUNT_TOTAL issues to process"
+          
+          if [ ! -f "all_issues.json" ]; then
+            echo "ERROR: all_issues.json not found"
+            exit 1
+          fi
+          echo "✓ Issue data file exists"
+          
           # Copy repomix output to ai-triage directory
+          echo ""
+          echo "Copying repomix output to ai-triage directory..."
           cp "$REPOMIX_OUTPUT" ai-triage/
+          echo "✓ Repomix output copied"
           
           # Initialize analyzed issues file (for duplicate detection)
           echo "[]" > analyzed_issues.json
+          echo "✓ Initialized analyzed_issues.json"
           
           # Process each issue
+          echo ""
+          echo "================================================================"
+          echo "Starting bulk analysis of $ISSUE_COUNT_TOTAL issues..."
+          echo "================================================================"
+          
           ISSUE_COUNT=0
           while IFS= read -r ISSUE_NUMBER; do
             ((ISSUE_COUNT++))
